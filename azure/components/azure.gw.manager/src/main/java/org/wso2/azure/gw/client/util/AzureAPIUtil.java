@@ -57,8 +57,10 @@ import org.wso2.azure.gw.client.policy.AzurePolicyBuilder;
 import org.wso2.azure.gw.client.policy.AzurePolicyBuilderFactory;
 import org.wso2.azure.gw.client.policy.policies.AzureCORSPolicy;
 import org.wso2.azure.gw.client.policy.policies.AzureJWTPolicy;
+import org.wso2.azure.gw.client.policy.policies.AzurePolicy;
 import org.wso2.azure.gw.client.policy.policies.AzureRateLimitPolicy;
 import org.wso2.azure.gw.client.policy.policies.AzureSetHeaderPolicy;
+import org.wso2.azure.gw.client.policy.policies.AzureTopicSmartPolicy;
 import org.wso2.carbon.apimgt.api.APIDefinition;
 import org.wso2.carbon.apimgt.api.APIManagementException;
 import org.wso2.carbon.apimgt.api.model.API;
@@ -68,6 +70,7 @@ import org.wso2.carbon.apimgt.api.model.OperationPolicy;
 import org.wso2.carbon.apimgt.api.model.Tier;
 import org.wso2.carbon.apimgt.api.model.URITemplate;
 import org.wso2.carbon.apimgt.impl.definitions.OASParserUtil;
+import org.wso2.carbon.apimgt.impl.definitions.AsyncApiParser;
 
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -305,72 +308,65 @@ public class AzureAPIUtil {
                 log.debug("API deployed successfully to Azure Gateway: " + api.getUuid());
             }
 
-            // AzurePolicyBuilderFactory policyBuilderFactory = new AzurePolicyBuilderFactory();
-            // AzurePolicyBuilder apiLevelPolicyBuilder =
-            //         policyBuilderFactory.newPolicyBuilder();
-            // apiLevelPolicyBuilder.addPolicy(new AzureCORSPolicy(api.getCorsConfiguration()),
-            //         AzureConstants.POLICY_DIRECTION_REQUEST);
+            try {
+                manager.apiOperations().define("onHandshake")
+                        .withExistingApi(resourceGroup, serviceName, apiContract.name())
+                        .withDisplayName("onHandshake")
+                        .withMethod("GET") // Handshake is a GET Upgrade request
+                        .withUrlTemplate("/")
+                        .create();
+            } catch (Exception e) {
+                // Ignore if it already exists or log warning
+                log.warn("onHandshake operation creation skipped or failed: " + e.getMessage());
+            }
 
-            // //configure API level policies
-            // List<OperationPolicy> apiPolicies = api.getApiPolicies();
-            // if (apiPolicies != null) {
-            //     for (OperationPolicy policy : apiPolicies) {
-            //         addPoliciesToPolicyBuilder(policy, apiLevelPolicyBuilder);
-            //     }
-            // }
+            // 2. Prepare the Policy Builder for 'onHandshake'
+            AzurePolicyBuilderFactory policyBuilderFactory = new AzurePolicyBuilderFactory();
+            AzurePolicyBuilder handshakePolicyBuilder = policyBuilderFactory.newPolicyBuilder();
 
-            // String apiLevelPolicyContent = apiLevelPolicyBuilder.build();
-            // if (apiLevelPolicyContent != null) {
-            //     ApiPoliciesCreateOrUpdateResponse response = manager.serviceClient().getApiPolicies().
-            //             createOrUpdateWithResponse(resourceGroup, serviceName, apiContract.name(), PolicyIdName.POLICY,
-            //                     new PolicyContractInner().withFormat(PolicyContentFormat.XML)
-            //                             .withValue(apiLevelPolicyContent), "*", Context.NONE);
-            //     if (response.getStatusCode() / 100 != 2) {
-            //         String errBody = response.getValue().value();
-            //         log.error("Failed to attach Azure policies: HTTP " + response.getStatusCode() + " body=" + errBody);
-            //         throw new APIManagementException("Failed to attach Azure policies: HTTP " + response.getStatusCode()
-            //                 + " body=" + errBody);
-            //     }
-            // }
+            // 3. Apply Global API Policies (e.g. Auth) to Handshake directly
+            // These run for everyone, regardless of topic.
+            List<OperationPolicy> apiPolicies = api.getApiPolicies();
+            if (apiPolicies != null) {
+                for (OperationPolicy policy : apiPolicies) {
+                    // Use the helper we created
+                    AzurePolicy azurePolicy = getAzurePolicyInstance(policy);
+                    handshakePolicyBuilder.addPolicy(azurePolicy, AzureConstants.POLICY_DIRECTION_REQUEST);
+                }
+            }
 
-            // // Configure Operation level policies
-            // IterableStream<OperationContract> operationContracts =
-            //         manager.apiOperations().listByApi(resourceGroup, serviceName, apiContract.name());
+            // 4. Apply TOPIC Specific Policies (The Smart Logic)
+            // Iterate through WSO2 Topics (URITemplates)
+            for (URITemplate topic : api.getUriTemplates()) {
+                List<OperationPolicy> topicPolicies = topic.getOperationPolicies();
+            
+                if (topicPolicies != null && !topicPolicies.isEmpty()) {
+                    // Create the Smart Wrapper for this topic (e.g., "/chat")
+                    AzureTopicSmartPolicy smartPolicy = new AzureTopicSmartPolicy(topic.getUriTemplate());
 
-            // for (URITemplate resource : api.getUriTemplates()) {
-            //     for (OperationPolicy policy : resource.getOperationPolicies()) {
-            //         AzurePolicyBuilder operationLevelPolicyBuilder =
-            //                 policyBuilderFactory.newPolicyBuilder();
-            //         addPoliciesToPolicyBuilder(policy, operationLevelPolicyBuilder);
-            //         String operationLevelPolicyContent = operationLevelPolicyBuilder.build();
+                    // Add all policies belonging to this topic into the wrapper
+                    for (OperationPolicy wso2Policy : topicPolicies) {
+                        AzurePolicy innerAzurePolicy = getAzurePolicyInstance(wso2Policy);
+                        smartPolicy.addInnerPolicy(innerAzurePolicy);
+                    }
 
-            //         PolicyContractInner resourceLevelJWTPolicy = new PolicyContractInner()
-            //                 .withFormat(PolicyContentFormat.XML)
-            //                 .withValue(operationLevelPolicyContent);
+                    // Add the wrapper (which contains the <choose> logic) to the main builder
+                    handshakePolicyBuilder.addPolicy(smartPolicy, AzureConstants.POLICY_DIRECTION_REQUEST);
+                }
+            }
 
-            //         String operationId = null;
-            //         for (OperationContract operationContract : operationContracts) {
-            //             if (operationContract.method().equals(resource.getHTTPVerb()) &&
-            //                     operationContract.urlTemplate().equals(resource.getUriTemplate())) {
-            //                 operationId = operationContract.name();
-            //                 break;
-            //             }
-            //         }
-            //         if (operationId == null) {
-            //             throw new APIManagementException("Azure API operation not found for resource: " +
-            //                     resource.getUriTemplate());
-            //         }
+            // 5. Build and Deploy the Policy XML
+            String handshakePolicyContent = handshakePolicyBuilder.build();
+            if (handshakePolicyContent != null) {
+                PolicyContractInner policyContract = new PolicyContractInner()
+                        .withFormat(PolicyContentFormat.XML)
+                        .withValue(handshakePolicyContent);
 
-            //         ApiOperationPoliciesCreateOrUpdateResponse response = manager.serviceClient()
-            //                 .getApiOperationPolicies().createOrUpdateWithResponse(resourceGroup, serviceName,
-            //                         apiContract.name(), operationId, PolicyIdName.POLICY, resourceLevelJWTPolicy,
-            //                         "*", Context.NONE);
-            //     }
-            // }
-
-            // if (log.isDebugEnabled()) {
-            //     log.debug("API deployed successfully to Azure Gateway: " + api.getUuid());
-            // }
+                ApiOperationPoliciesCreateOrUpdateResponse response = manager.serviceClient()
+                        .getApiOperationPolicies().createOrUpdateWithResponse(resourceGroup, serviceName,
+                                apiContract.name(), "onHandshake", PolicyIdName.POLICY, policyContract,
+                                "*", Context.NONE);
+            }
 
             PagedIterable<ApiRevisionContract> revisions = manager.apiRevisions().listByService(resourceGroup,
                 serviceName, apiContract.name(), "isCurrent eq true", /* top */ null, /* skip */ null, Context.NONE);
@@ -459,6 +455,52 @@ public class AzureAPIUtil {
             policyBuilder.addPolicy(new AzureRateLimitPolicy(calls, renewalPeriod, retryAfterHeaderName,
                     retryAfterVariableName, remainingCallsHeaderName, remainingCallsVariableName, totalCallsHeaderName),
                     policy.getDirection());
+        } else {
+            throw new APIManagementException("Unsupported Azure policy: " + policy.getPolicyName());
+        }
+    }
+
+    /**
+     * Factory method to convert WSO2 OperationPolicy to AzurePolicy object.
+     */
+    private static AzurePolicy getAzurePolicyInstance(OperationPolicy policy) throws APIManagementException {
+        if (policy.getPolicyName().equals(AzureConstants.AZURE_OAUTH2_OPERATION_POLICY_NAME)) {
+            String openIdURL = policy.getParameters()
+                    .get(AzureConstants.AZURE_OAUTH2_OPERATION_POLICY_PARAMETER_OPENID_URL).toString();
+            return new AzureJWTPolicy(openIdURL);
+
+        } else if (policy.getPolicyName().equals(AzureConstants.AZURE_SET_HEADER_POLICY_NAME)) {
+            String headerName = policy.getParameters()
+                    .get(AzureConstants.AZURE_SET_HEADER_POLICY_HEADER_NAME).toString();
+            String headerValue = policy.getParameters()
+                    .get(AzureConstants.AZURE_SET_HEADER_POLICY_HEADER_VALUE).toString();
+            String existsAction = policy.getParameters()
+                    .get(AzureConstants.AZURE_SET_HEADER_POLICY_EXISTS_ACTION).toString();
+            return new AzureSetHeaderPolicy(headerName, headerValue, existsAction);
+
+        } else if (policy.getPolicyName().equals(AzureConstants.AZURE_RATE_LIMIT_POLICY_NAME)) {
+            // Extract mandatory parameters
+            String calls = policy.getParameters().get(AzureConstants.AZURE_RATE_LIMIT_POLICY_CALLS).toString();
+            String renewalPeriod = policy.getParameters().get(AzureConstants.AZURE_RATE_LIMIT_POLICY_RENEWAL_PERIOD).toString();
+
+            // Extract optional parameters safely
+            Object retryAfterHeaderNameObj = policy.getParameters().get(AzureConstants.AZURE_RATE_LIMIT_POLICY_RETRY_AFTER_HEADER_NAME);
+            String retryAfterHeaderName = retryAfterHeaderNameObj != null ? retryAfterHeaderNameObj.toString() : null;
+
+            Object retryAfterVariableNameObj = policy.getParameters().get(AzureConstants.AZURE_RATE_LIMIT_POLICY_RETRY_AFTER_VARIABLE_NAME);
+            String retryAfterVariableName = retryAfterVariableNameObj != null ? retryAfterVariableNameObj.toString() : null;
+
+            Object remainingCallsHeaderNameObj = policy.getParameters().get(AzureConstants.AZURE_RATE_LIMIT_POLICY_REMAINING_CALLS_HEADER_NAME);
+            String remainingCallsHeaderName = remainingCallsHeaderNameObj != null ? remainingCallsHeaderNameObj.toString() : null;
+
+            Object remainingCallsVariableNameObj = policy.getParameters().get(AzureConstants.AZURE_RATE_LIMIT_POLICY_REMAINING_CALLS_VARIABLE_NAME);
+            String remainingCallsVariableName = remainingCallsVariableNameObj != null ? remainingCallsVariableNameObj.toString() : null;
+
+            Object totalCallsHeaderNameObj = policy.getParameters().get(AzureConstants.AZURE_RATE_LIMIT_POLICY_TOTAL_CALLS_HEADER_NAME);
+            String totalCallsHeaderName = totalCallsHeaderNameObj != null ? totalCallsHeaderNameObj.toString() : null;
+
+            return new AzureRateLimitPolicy(calls, renewalPeriod, retryAfterHeaderName,
+                    retryAfterVariableName, remainingCallsHeaderName, remainingCallsVariableName, totalCallsHeaderName);
         } else {
             throw new APIManagementException("Unsupported Azure policy: " + policy.getPolicyName());
         }
@@ -588,6 +630,16 @@ public class AzureAPIUtil {
         context += getContextWithoutVersion(path, apiIdentifier.getVersion());
         String contextTemplate = context;
 
+        String asyncApiDefinition = loadAsyncApiTemplate(apiContract.displayName(), apiIdentifier.getVersion());
+
+        Set<URITemplate> uriTemplates = new HashSet<>();
+        try {
+            AsyncApiParser parser = new AsyncApiParser(); 
+            uriTemplates = parser.getURITemplates(asyncApiDefinition);
+        } catch (APIManagementException e) {
+            log.error("Failed to parse AsyncAPI definition", e);
+        }
+
         api.setDisplayName(apiContract.displayName());
         api.setUuid(UUID.randomUUID().toString());
         api.setDescription(apiContract.description());
@@ -603,11 +655,9 @@ public class AzureAPIUtil {
         api.setGatewayType(environment.getGatewayType());
         api.setType("WS");
         api.setTransports("ws,wss");
-        String asyncApiDefinition = loadAsyncApiTemplate(apiContract.displayName(), apiIdentifier.getVersion());
-
-
         api.setAsyncApiDefinition(asyncApiDefinition);
         api.setSwaggerDefinition(asyncApiDefinition);
+        api.setUriTemplates(uriTemplates);
         if (apiContract.serviceUrl() != null) {
             api.setEndpointConfig(AzureAPIUtil.buildEndpointConfigJson(
                     apiContract.serviceUrl(), apiContract.serviceUrl(), false, true));
